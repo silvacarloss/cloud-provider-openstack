@@ -25,9 +25,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/gophercloud/gophercloud/openstack/utils"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/utils"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v2"
 	apiv1 "k8s.io/api/core/v1"
@@ -92,7 +92,7 @@ type Auth struct {
 	syncer         *Syncer
 	config         *Config
 	stopCh         chan struct{}
-	queue          workqueue.RateLimitingInterface
+	queue          workqueue.TypedRateLimitingInterface[any]
 	informer       informers.SharedInformerFactory
 	cmLister       corelisters.ConfigMapLister
 	cmListerSynced cache.InformerSynced
@@ -491,7 +491,7 @@ func NewKeystoneAuth(c *Config) (*Auth, error) {
 	}
 
 	if k8sClient != nil {
-		queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
 		kubeInformerFactory := informers.NewSharedInformerFactory(k8sClient, time.Minute*5)
 		cmInformer := kubeInformerFactory.Core().V1().ConfigMaps()
 		_, err := cmInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -542,7 +542,7 @@ func createIdentityV3Provider(options gophercloud.AuthOptions, transport http.Ro
 	versions := []*utils.Version{
 		{ID: "v3", Priority: 30, Suffix: "/v3/"},
 	}
-	chosen, _, err := utils.ChooseVersion(client, versions)
+	chosen, _, err := utils.ChooseVersion(context.TODO(), client, versions)
 	if err != nil {
 		return nil, fmt.Errorf("unable to find identity API v3 version : %v", err)
 	}

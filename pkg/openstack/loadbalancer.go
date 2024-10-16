@@ -20,24 +20,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/keymanager/v1/containers"
-	"github.com/gophercloud/gophercloud/openstack/keymanager/v1/secrets"
-	"github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/listeners"
-	"github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/loadbalancers"
-	v2monitors "github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/monitors"
-	v2pools "github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/pools"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/subnets"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/containers"
+	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/secrets"
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/listeners"
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/loadbalancers"
+	v2monitors "github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/monitors"
+	v2pools "github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/pools"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/floatingips"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/subnets"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 	netutils "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/cloud-provider-openstack/pkg/metrics"
 	cpoutil "k8s.io/cloud-provider-openstack/pkg/util"
@@ -122,7 +124,7 @@ type serviceConfig struct {
 	lbPublicSubnetSpec          *floatingSubnetSpec
 	nodeSelectors               map[string]string
 	keepClientIP                bool
-	enableProxyProtocol         bool
+	proxyProtocolVersion        *v2pools.Protocol
 	timeoutClientData           int
 	timeoutMemberConnect        int
 	timeoutMemberData           int
@@ -273,7 +275,7 @@ func (lbaas *LbaasV2) createOctaviaLoadBalancer(name, clusterName string, servic
 	if !lbaas.opts.ProviderRequiresSerialAPICalls {
 		for portIndex, port := range service.Spec.Ports {
 			listenerCreateOpt := lbaas.buildListenerCreateOpt(port, svcConf, cpoutil.Sprintf255(listenerFormat, portIndex, name))
-			members, newMembers, err := lbaas.buildBatchUpdateMemberOpts(port, nodes, svcConf)
+			members, newMembers, err := lbaas.buildCreateMemberOpts(port, nodes, svcConf)
 			if err != nil {
 				return nil, err
 			}
@@ -294,7 +296,7 @@ func (lbaas *LbaasV2) createOctaviaLoadBalancer(name, clusterName string, servic
 	}
 
 	mc := metrics.NewMetricContext("loadbalancer", "create")
-	loadbalancer, err := loadbalancers.Create(lbaas.lb, createOpts).Extract()
+	loadbalancer, err := loadbalancers.Create(context.TODO(), lbaas.lb, createOpts).Extract()
 	if mc.ObserveRequest(err) != nil {
 		var printObj interface{} = createOpts
 		if opts, err := json.Marshal(createOpts); err == nil {
@@ -472,6 +474,21 @@ func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string,
 	return defaultSetting
 }
 
+// getProxyProtocolFromServiceAnnotation searches a given v1.Service the ServiceAnnotationLoadBalancerProxyEnabled to guess if the proxyProtocol needs to be
+// enabled and return the ProxyProtocol's version which is need to be applied
+func getProxyProtocolFromServiceAnnotation(service *corev1.Service) *v2pools.Protocol {
+	switch getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyEnabled, "false") {
+	case "true":
+		return ptr.To(v2pools.ProtocolPROXY)
+	case "v1":
+		return ptr.To(v2pools.ProtocolPROXY)
+	case "v2":
+		return ptr.To(v2pools.ProtocolPROXYV2)
+	default:
+		return nil
+	}
+}
+
 // getSubnetIDForLB returns subnet-id for a specific node
 func getSubnetIDForLB(network *gophercloud.ServiceClient, node corev1.Node, preferredIPFamily corev1.IPFamily) (string, error) {
 	ipAddress, err := nodeAddressForLB(&node, preferredIPFamily)
@@ -479,7 +496,7 @@ func getSubnetIDForLB(network *gophercloud.ServiceClient, node corev1.Node, pref
 		return "", err
 	}
 
-	_, instanceID, err := instanceIDFromProviderID(node.Spec.ProviderID)
+	instanceID, _, err := instanceIDFromProviderID(node.Spec.ProviderID)
 	if err != nil {
 		return "", fmt.Errorf("can't determine instance ID from ProviderID when autodetecting LB subnet: %w", err)
 	}
@@ -576,7 +593,7 @@ func (lbaas *LbaasV2) deleteOctaviaListeners(lbID string, listenerList []listene
 func (lbaas *LbaasV2) createFloatingIP(msg string, floatIPOpts floatingips.CreateOpts) (*floatingips.FloatingIP, error) {
 	klog.V(4).Infof("%s floating ip with opts %+v", msg, floatIPOpts)
 	mc := metrics.NewMetricContext("floating_ip", "create")
-	floatIP, err := floatingips.Create(lbaas.network, floatIPOpts).Extract()
+	floatIP, err := floatingips.Create(context.TODO(), lbaas.network, floatIPOpts).Extract()
 	err = PreserveGopherError(err)
 	if mc.ObserveRequest(err) != nil {
 		return floatIP, fmt.Errorf("error creating LB floatingip: %v", err)
@@ -594,7 +611,7 @@ func (lbaas *LbaasV2) updateFloatingIP(floatingip *floatingips.FloatingIP, portI
 		klog.V(4).Infof("Detaching floating ip %q from port %q", floatingip.FloatingIP, floatingip.PortID)
 	}
 	mc := metrics.NewMetricContext("floating_ip", "update")
-	floatingip, err := floatingips.Update(lbaas.network, floatingip.ID, floatUpdateOpts).Extract()
+	floatingip, err := floatingips.Update(context.TODO(), lbaas.network, floatingip.ID, floatUpdateOpts).Extract()
 	if mc.ObserveRequest(err) != nil {
 		return nil, fmt.Errorf("error updating LB floatingip %+v: %v", floatUpdateOpts, err)
 	}
@@ -866,8 +883,8 @@ func (lbaas *LbaasV2) ensureOctaviaPool(lbID string, name string, listener *list
 
 	// By default, use the protocol of the listener
 	poolProto := v2pools.Protocol(listener.Protocol)
-	if svcConf.enableProxyProtocol {
-		poolProto = v2pools.ProtocolPROXY
+	if svcConf.proxyProtocolVersion != nil {
+		poolProto = *svcConf.proxyProtocolVersion
 	} else if (svcConf.keepClientIP || svcConf.tlsContainerRef != "") && poolProto != v2pools.ProtocolHTTP {
 		poolProto = v2pools.ProtocolHTTP
 	}
@@ -933,8 +950,8 @@ func (lbaas *LbaasV2) ensureOctaviaPool(lbID string, name string, listener *list
 func (lbaas *LbaasV2) buildPoolCreateOpt(listenerProtocol string, service *corev1.Service, svcConf *serviceConfig, name string) v2pools.CreateOpts {
 	// By default, use the protocol of the listener
 	poolProto := v2pools.Protocol(listenerProtocol)
-	if svcConf.enableProxyProtocol {
-		poolProto = v2pools.ProtocolPROXY
+	if svcConf.proxyProtocolVersion != nil {
+		poolProto = *svcConf.proxyProtocolVersion
 	} else if (svcConf.keepClientIP || svcConf.tlsContainerRef != "") && poolProto != v2pools.ProtocolHTTP {
 		if svcConf.keepClientIP && svcConf.tlsContainerRef != "" {
 			klog.V(4).Infof("Forcing to use %q protocol for pool because annotations %q %q are set", v2pools.ProtocolHTTP, ServiceAnnotationLoadBalancerXForwardedFor, ServiceAnnotationTlsContainerRef)
@@ -1001,6 +1018,31 @@ func (lbaas *LbaasV2) buildBatchUpdateMemberOpts(port corev1.ServicePort, nodes 
 		}
 	}
 	return members, newMembers, nil
+}
+
+func (lbaas *LbaasV2) buildCreateMemberOpts(port corev1.ServicePort, nodes []*corev1.Node, svcConf *serviceConfig) ([]v2pools.CreateMemberOpts, sets.Set[string], error) {
+	batchUpdateMemberOpts, newMembers, err := lbaas.buildBatchUpdateMemberOpts(port, nodes, svcConf)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	createMemberOpts := make([]v2pools.CreateMemberOpts, len(batchUpdateMemberOpts))
+	for i := range batchUpdateMemberOpts {
+		createMemberOpts[i] = v2pools.CreateMemberOpts{
+			Address:        batchUpdateMemberOpts[i].Address,
+			ProtocolPort:   batchUpdateMemberOpts[i].ProtocolPort,
+			Name:           ptr.Deref(batchUpdateMemberOpts[i].Name, ""),
+			ProjectID:      batchUpdateMemberOpts[i].ProjectID,
+			Weight:         batchUpdateMemberOpts[i].Weight,
+			SubnetID:       ptr.Deref(batchUpdateMemberOpts[i].SubnetID, ""),
+			AdminStateUp:   batchUpdateMemberOpts[i].AdminStateUp,
+			Backup:         batchUpdateMemberOpts[i].Backup,
+			MonitorAddress: ptr.Deref(batchUpdateMemberOpts[i].MonitorAddress, ""),
+			MonitorPort:    batchUpdateMemberOpts[i].MonitorPort,
+			Tags:           batchUpdateMemberOpts[i].Tags,
+		}
+	}
+	return createMemberOpts, newMembers, nil
 }
 
 // Make sure the listener is created for Service
@@ -1283,12 +1325,11 @@ func (lbaas *LbaasV2) checkServiceUpdate(service *corev1.Service, nodes []*corev
 
 	// This affects the protocol of listener and pool
 	keepClientIP := getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerXForwardedFor, false)
-	useProxyProtocol := getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyEnabled, false)
-	if useProxyProtocol && keepClientIP {
+	svcConf.proxyProtocolVersion = getProxyProtocolFromServiceAnnotation(service)
+	if svcConf.proxyProtocolVersion != nil && keepClientIP {
 		return fmt.Errorf("annotation %s and %s cannot be used together", ServiceAnnotationLoadBalancerProxyEnabled, ServiceAnnotationLoadBalancerXForwardedFor)
 	}
 	svcConf.keepClientIP = keepClientIP
-	svcConf.enableProxyProtocol = useProxyProtocol
 
 	svcConf.tlsContainerRef = getStringFromServiceAnnotation(service, ServiceAnnotationTlsContainerRef, lbaas.opts.TlsContainerRef)
 	svcConf.enableMonitor = getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerEnableHealthMonitor, lbaas.opts.CreateMonitor)
@@ -1308,7 +1349,7 @@ func (lbaas *LbaasV2) checkServiceDelete(service *corev1.Service, svcConf *servi
 
 	// This affects the protocol of listener and pool
 	svcConf.keepClientIP = getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerXForwardedFor, false)
-	svcConf.enableProxyProtocol = getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyEnabled, false)
+	svcConf.proxyProtocolVersion = getProxyProtocolFromServiceAnnotation(service)
 	svcConf.tlsContainerRef = getStringFromServiceAnnotation(service, ServiceAnnotationTlsContainerRef, lbaas.opts.TlsContainerRef)
 
 	return nil
@@ -1371,13 +1412,13 @@ func (lbaas *LbaasV2) checkService(service *corev1.Service, nodes []*corev1.Node
 			barbicanUUID := slice[len(slice)-1]
 			barbicanType := slice[len(slice)-2]
 			if barbicanType == "containers" {
-				container, err := containers.Get(lbaas.secret, barbicanUUID).Extract()
+				container, err := containers.Get(context.TODO(), lbaas.secret, barbicanUUID).Extract()
 				if err != nil {
 					return fmt.Errorf("failed to get tls container %q: %v", svcConf.tlsContainerRef, err)
 				}
 				klog.V(4).Infof("Default TLS container %q found", container.ContainerRef)
 			} else if barbicanType == "secrets" {
-				secret, err := secrets.Get(lbaas.secret, barbicanUUID).Extract()
+				secret, err := secrets.Get(context.TODO(), lbaas.secret, barbicanUUID).Extract()
 				if err != nil {
 					return fmt.Errorf("failed to get tls secret %q: %v", svcConf.tlsContainerRef, err)
 				}
@@ -1488,7 +1529,7 @@ func (lbaas *LbaasV2) checkService(service *corev1.Service, nodes []*corev1.Node
 		// check configured subnet belongs to network
 		if floatingNetworkID != "" && floatingSubnet.subnetID != "" {
 			mc := metrics.NewMetricContext("subnet", "get")
-			subnet, err := subnets.Get(lbaas.network, floatingSubnet.subnetID).Extract()
+			subnet, err := subnets.Get(context.TODO(), lbaas.network, floatingSubnet.subnetID).Extract()
 			if mc.ObserveRequest(err) != nil {
 				return fmt.Errorf("failed to find subnet %q: %v", floatingSubnet.subnetID, err)
 			}
@@ -1510,12 +1551,11 @@ func (lbaas *LbaasV2) checkService(service *corev1.Service, nodes []*corev1.Node
 	}
 
 	keepClientIP := getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerXForwardedFor, false)
-	useProxyProtocol := getBoolFromServiceAnnotation(service, ServiceAnnotationLoadBalancerProxyEnabled, false)
-	if useProxyProtocol && keepClientIP {
+	svcConf.proxyProtocolVersion = getProxyProtocolFromServiceAnnotation(service)
+	if svcConf.proxyProtocolVersion != nil && keepClientIP {
 		return fmt.Errorf("annotation %s and %s cannot be used together", ServiceAnnotationLoadBalancerProxyEnabled, ServiceAnnotationLoadBalancerXForwardedFor)
 	}
 	svcConf.keepClientIP = keepClientIP
-	svcConf.enableProxyProtocol = useProxyProtocol
 
 	if openstackutil.IsOctaviaFeatureSupported(lbaas.lb, openstackutil.OctaviaFeatureTimeout, lbaas.opts.LBProvider) {
 		svcConf.timeoutClientData = getIntFromServiceAnnotation(service, ServiceAnnotationLoadBalancerTimeoutClientData, 50000)
@@ -1600,7 +1640,7 @@ func (lbaas *LbaasV2) createLoadBalancerStatus(service *corev1.Service, svcConf 
 	}
 
 	ipMode := corev1.LoadBalancerIPModeVIP
-	if svcConf.enableProxyProtocol {
+	if svcConf.proxyProtocolVersion != nil {
 		// If the load balancer is using the PROXY protocol, expose its IP address via
 		// the Hostname field to prevent kube-proxy from injecting an iptables bypass.
 		// Setting must be removed by the user to allow the use of the LoadBalancerIPModeProxy.
@@ -1829,7 +1869,7 @@ func (lbaas *LbaasV2) listSubnetsForNetwork(networkID string, tweak ...TweakSubN
 		}
 	}
 	mc := metrics.NewMetricContext("subnet", "list")
-	allPages, err := subnets.List(lbaas.network, opts).AllPages()
+	allPages, err := subnets.List(lbaas.network, opts).AllPages(context.TODO())
 	if mc.ObserveRequest(err) != nil {
 		return nil, fmt.Errorf("error listing subnets of network %s: %v", networkID, err)
 	}
@@ -1952,7 +1992,7 @@ func (lbaas *LbaasV2) deleteFIPIfCreatedByProvider(fip *floatingips.FloatingIP, 
 	}
 	klog.InfoS("Deleting floating IP for service", "floatingIP", fip.FloatingIP, "service", klog.KObj(service))
 	mc := metrics.NewMetricContext("floating_ip", "delete")
-	err = floatingips.Delete(lbaas.network, fip.ID).ExtractErr()
+	err = floatingips.Delete(context.TODO(), lbaas.network, fip.ID).ExtractErr()
 	if mc.ObserveRequest(err) != nil {
 		return false, fmt.Errorf("failed to delete floating IP %s for loadbalancer VIP port %s: %v", fip.FloatingIP, portID, err)
 	}
@@ -2193,25 +2233,30 @@ func PreserveGopherError(rawError error) error {
 		rawError = v.ErrOriginal
 	}
 	var details []byte
-	switch e := rawError.(type) {
-	case gophercloud.ErrDefault400:
-	case gophercloud.ErrDefault401:
-		details = e.Body
-	case gophercloud.ErrDefault403:
-	case gophercloud.ErrDefault404:
-		details = e.Body
-	case gophercloud.ErrDefault405:
-		details = e.Body
-	case gophercloud.ErrDefault408:
-		details = e.Body
-	case gophercloud.ErrDefault409:
-	case gophercloud.ErrDefault429:
-		details = e.Body
-	case gophercloud.ErrDefault500:
-		details = e.Body
-	case gophercloud.ErrDefault503:
-		details = e.Body
-	default:
+
+	if e, ok := rawError.(gophercloud.ErrUnexpectedResponseCode); ok {
+		switch e.Actual {
+		case http.StatusBadRequest:
+		case http.StatusUnauthorized:
+			details = e.Body
+		case http.StatusForbidden:
+		case http.StatusNotFound:
+			details = e.Body
+		case http.StatusMethodNotAllowed:
+			details = e.Body
+		case http.StatusRequestTimeout:
+			details = e.Body
+		case http.StatusConflict:
+		case http.StatusTooManyRequests:
+			details = e.Body
+		case http.StatusInternalServerError:
+			details = e.Body
+		case http.StatusServiceUnavailable:
+			details = e.Body
+		default:
+			return rawError
+		}
+	} else {
 		return rawError
 	}
 

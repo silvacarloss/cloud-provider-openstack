@@ -30,9 +30,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/l7policies"
-	"github.com/gophercloud/gophercloud/openstack/loadbalancer/v2/pools"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/security/groups"
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/l7policies"
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/pools"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/groups"
 	log "github.com/sirupsen/logrus"
 	apiv1 "k8s.io/api/core/v1"
 	nwv1 "k8s.io/api/networking/v1"
@@ -160,7 +160,7 @@ type Event struct {
 type Controller struct {
 	stopCh              chan struct{}
 	knownNodes          []*apiv1.Node
-	queue               workqueue.RateLimitingInterface
+	queue               workqueue.TypedRateLimitingInterface[any]
 	informer            informers.SharedInformerFactory
 	recorder            record.EventRecorder
 	ingressLister       nwlisters.IngressLister
@@ -310,7 +310,7 @@ func NewController(conf config.Config) *Controller {
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, time.Second*30)
 	serviceInformer := kubeInformerFactory.Core().V1().Services()
 	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
 
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)

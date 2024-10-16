@@ -1,13 +1,13 @@
 package cinder
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
 	"k8s.io/cloud-provider-openstack/pkg/util/metadata"
@@ -44,10 +44,10 @@ func NewVolumeCapabilityAccessMode(mode csi.VolumeCapability_AccessMode_Mode) *c
 }
 
 //revive:disable:unexported-return
-func NewControllerServer(d *Driver, cloud openstack.IOpenStack) *controllerServer {
+func NewControllerServer(d *Driver, clouds map[string]openstack.IOpenStack) *controllerServer {
 	return &controllerServer{
 		Driver: d,
-		Cloud:  cloud,
+		Clouds: clouds,
 	}
 }
 
@@ -57,12 +57,13 @@ func NewIdentityServer(d *Driver) *identityServer {
 	}
 }
 
-func NewNodeServer(d *Driver, mount mount.IMount, metadata metadata.IMetadata, cloud openstack.IOpenStack) *nodeServer {
+func NewNodeServer(d *Driver, mount mount.IMount, metadata metadata.IMetadata, cloud openstack.IOpenStack, topologies map[string]string) *nodeServer {
 	return &nodeServer{
-		Driver:   d,
-		Mount:    mount,
-		Metadata: metadata,
-		Cloud:    cloud,
+		Driver:     d,
+		Mount:      mount,
+		Metadata:   metadata,
+		Cloud:      cloud,
+		Topologies: topologies,
 	}
 }
 

@@ -21,12 +21,12 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/backups"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/backups"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/spf13/pflag"
 	gcfg "gopkg.in/gcfg.v1"
 	"k8s.io/cloud-provider-openstack/pkg/client"
@@ -90,13 +90,16 @@ type BlockStorageOpts struct {
 }
 
 type Config struct {
-	Global       client.AuthOpts
+	Global       map[string]*client.AuthOpts
 	Metadata     metadata.Opts
 	BlockStorage BlockStorageOpts
 }
 
 func logcfg(cfg Config) {
-	client.LogCfg(cfg.Global)
+	for cloudName, global := range cfg.Global {
+		klog.V(0).Infof("Global: \"%s\"", cloudName)
+		client.LogCfg(*global)
+	}
 	klog.Infof("Block storage opts: %v", cfg.BlockStorage)
 }
 
@@ -121,16 +124,18 @@ func GetConfigFromFiles(configFilePaths []string) (Config, error) {
 		}
 	}
 
-	// Update the config with data from clouds.yaml if UseClouds is enabled
-	if cfg.Global.UseClouds {
-		if cfg.Global.CloudsFile != "" {
-			os.Setenv("OS_CLIENT_CONFIG_FILE", cfg.Global.CloudsFile)
+	for _, global := range cfg.Global {
+		// Update the config with data from clouds.yaml if UseClouds is enabled
+		if global.UseClouds {
+			if global.CloudsFile != "" {
+				os.Setenv("OS_CLIENT_CONFIG_FILE", global.CloudsFile)
+			}
+			err := client.ReadClouds(global)
+			if err != nil {
+				return cfg, err
+			}
+			klog.V(5).Infof("Credentials are loaded from %s:", global.CloudsFile)
 		}
-		err := client.ReadClouds(&cfg.Global)
-		if err != nil {
-			return cfg, err
-		}
-		klog.V(5).Infof("Credentials are loaded from %s:", cfg.Global.CloudsFile)
 	}
 
 	return cfg, nil
@@ -138,10 +143,13 @@ func GetConfigFromFiles(configFilePaths []string) (Config, error) {
 
 const defaultMaxVolAttachLimit int64 = 256
 
-var OsInstance IOpenStack
+var OsInstances map[string]IOpenStack
+var NoopInstances map[string]IOpenStack
 var configFiles = []string{"/etc/cloud.conf"}
 
 func InitOpenStackProvider(cfgFiles []string, httpEndpoint string) {
+	OsInstances = make(map[string]IOpenStack)
+	NoopInstances = make(map[string]IOpenStack)
 	metrics.RegisterMetrics("cinder-csi")
 	if httpEndpoint != "" {
 		mux := http.NewServeMux()
@@ -159,8 +167,8 @@ func InitOpenStackProvider(cfgFiles []string, httpEndpoint string) {
 	klog.V(2).Infof("InitOpenStackProvider configFiles: %s", configFiles)
 }
 
-// CreateOpenStackProvider creates Openstack Instance
-func CreateOpenStackProvider() (IOpenStack, error) {
+// CreateOpenStackProvider creates Openstack Instance with custom Global config param
+func CreateOpenStackProvider(cloudName string, noClient bool) (IOpenStack, error) {
 	// Get config from file
 	cfg, err := GetConfigFromFiles(configFiles)
 	if err != nil {
@@ -168,15 +176,34 @@ func CreateOpenStackProvider() (IOpenStack, error) {
 		return nil, err
 	}
 	logcfg(cfg)
+	global := cfg.Global[cloudName]
+	if global == nil && !noClient {
+		return nil, fmt.Errorf("GetConfigFromFiles cloud name \"%s\" not found in configuration files: %s", cloudName, configFiles)
+	}
 
-	provider, err := client.NewOpenStackClient(&cfg.Global, "cinder-csi-plugin", userAgentData...)
+	// if no search order given, use default
+	if len(cfg.Metadata.SearchOrder) == 0 {
+		cfg.Metadata.SearchOrder = fmt.Sprintf("%s,%s", metadata.ConfigDriveID, metadata.MetadataID)
+	}
+
+	if noClient {
+		// Init OpenStack
+		NoopInstances[cloudName] = &NoopOpenStack{
+			bsOpts:       cfg.BlockStorage,
+			metadataOpts: cfg.Metadata,
+		}
+
+		return NoopInstances[cloudName], nil
+	}
+
+	provider, err := client.NewOpenStackClient(global, "cinder-csi-plugin", userAgentData...)
 	if err != nil {
 		return nil, err
 	}
 
 	epOpts := gophercloud.EndpointOpts{
-		Region:       cfg.Global.Region,
-		Availability: cfg.Global.EndpointType,
+		Region:       global.Region,
+		Availability: global.EndpointType,
 	}
 
 	// Init Nova ServiceClient
@@ -191,13 +218,8 @@ func CreateOpenStackProvider() (IOpenStack, error) {
 		return nil, err
 	}
 
-	// if no search order given, use default
-	if len(cfg.Metadata.SearchOrder) == 0 {
-		cfg.Metadata.SearchOrder = fmt.Sprintf("%s,%s", metadata.ConfigDriveID, metadata.MetadataID)
-	}
-
 	// Init OpenStack
-	OsInstance = &OpenStack{
+	OsInstances[cloudName] = &OpenStack{
 		compute:      computeclient,
 		blockstorage: blockstorageclient,
 		bsOpts:       cfg.BlockStorage,
@@ -205,16 +227,29 @@ func CreateOpenStackProvider() (IOpenStack, error) {
 		metadataOpts: cfg.Metadata,
 	}
 
-	return OsInstance, nil
+	return OsInstances[cloudName], nil
 }
 
 // GetOpenStackProvider returns Openstack Instance
-func GetOpenStackProvider() (IOpenStack, error) {
-	if OsInstance != nil {
+func GetOpenStackProvider(cloudName string, noClient bool) (IOpenStack, error) {
+	if noClient {
+		NoopInstance, NoopInstanceDefined := NoopInstances[cloudName]
+		if NoopInstanceDefined {
+			return NoopInstance, nil
+		}
+		NoopInstance, err := CreateOpenStackProvider(cloudName, noClient)
+		if err != nil {
+			return nil, err
+		}
+
+		return NoopInstance, nil
+	}
+
+	OsInstance, OsInstanceDefined := OsInstances[cloudName]
+	if OsInstanceDefined {
 		return OsInstance, nil
 	}
-	var err error
-	OsInstance, err = CreateOpenStackProvider()
+	OsInstance, err := CreateOpenStackProvider(cloudName, noClient)
 	if err != nil {
 		return nil, err
 	}
